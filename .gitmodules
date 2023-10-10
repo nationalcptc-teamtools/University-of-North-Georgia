@@ -1,0 +1,9 @@
+[submodule "wordlists/cgi-bin-enum-wordlists"]
+	path = wordlists/cgi-bin-enum-wordlists
+	url = git@github.com:sawshep/cgi-bin-enum-wordlists
+[submodule "scripts/linux-smart-enumeration"]
+	path = scripts/linux-smart-enumeration
+	url = git@github.com:sawshep/linux-smart-enumeration
+[submodule "tools/git-dumper"]
+	path = tools/git-dumper
+	url = git@github.com:holly-hacker/git-dumper.git
