@@ -9,4 +9,4 @@
 	url = git@github.com:holly-hacker/git-dumper.git
 [submodule "shells/PayloadGen"]
 	path = shells/PayloadGen
-	url = git@github.com:tmcbride75/PayloadGen.git
+	url = https://github.com/tmcbride75/PayloadGen.git
