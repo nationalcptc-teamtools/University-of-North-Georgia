@@ -1,29 +1,43 @@
 #!/usr/bin/env python3
-"""Bootstrap the CPTC report configuration into a current/original PwnDoc instance."""
+"""Set up a minimal, findings-only CPTC configuration in PwnDoc.
+
+This script is intentionally narrow. It does not create executive-report sections or
+modify the full CPTC report workflow. It uploads the findings-only DOCX, creates the
+finding-level custom fields used by that template, creates a dedicated audit type,
+and verifies the result.
+
+The script uses only the Python standard library.
+"""
 
 import argparse
 import base64
 import getpass
 import http.cookiejar
 import json
+import re
 import ssl
 import sys
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 
-# ============================== QUICK CONFIG ==============================
+# ============================================================================
+# QUICK CONFIG
+# ============================================================================
 
 BASE_URL = "https://localhost:8443"
-TEMPLATE_NAME = "CPTC_PwnDoc_Template"
-TEMPLATE_FILE = Path(__file__).resolve().with_name("CPTC_PwnDoc_Template.docx")
-AUDIT_TYPE_NAME = "CPTC Penetration Test"
+TEMPLATE_NAME = "CPTC_Findings_Only"
+TEMPLATE_FILE = Path(__file__).resolve().with_name(
+    "CPTC_PwnDoc_Findings_Only_v2.docx"
+)
+
+AUDIT_TYPE_NAME = "CPTC Findings Only"
 PRIMARY_LOCALE = "en"
 PRIMARY_LANGUAGE = "English"
-DEFAULT_TEAM_NAME = "UNG CyberHawks"
-DEFAULT_COMPLIANCE_FRAMEWORKS = ""
 VERIFY_TLS = False
 UPDATE_TEMPLATE_IF_EXISTS = True
 
@@ -35,106 +49,121 @@ RISK_OPTIONS = [
     "Critical",
 ]
 
-SECTIONS = [
-    ("Purpose", "execpurpose"),
-    ("Scope of Evaluation", "execscope"),
-    ("Assumptions", "execassumptions"),
-    ("Limitations", "execlimitations"),
-    ("Summary of Findings", "execsummary"),
-    ("Overall Risks and Impacts", "execrisks"),
-    ("Executive Recommendations", "execrecommend"),
-    ("Final Notes", "execnotes"),
-    ("Engagement Timeline", "timeline"),
-    ("PTES Diagram", "ptesdiagram"),
-    ("Compliance Frameworks", "compliance"),
-    ("Key Security Strengths", "strengths"),
-    ("Key Areas for Improvement", "improvements"),
-    ("Network Topology", "topology"),
-    ("MITRE Overview", "mitreoverview"),
-    ("Attack Narrative", "attacknarrative"),
-    ("Tools Used", "toolsused"),
-]
+
+# These labels intentionally match the custom-field tags used by the DOCX.
+# PwnDoc converts the field labels to lower-case tag names without spaces.
+FIELD_TAGS = {
+    "Business Risk": "businessrisk",
+    "Risk Impact": "riskimpact",
+    "Risk Probability": "riskprobability",
+    "Attack Tactic": "attacktactic",
+    "Attack Technique ID": "attacktechniqueid",
+    "Detection Gaps": "detectiongaps",
+}
+
 
 FIELDS = [
-    dict(
-        label="Team Name",
-        fieldType="input",
-        display="general",
-        displaySub="",
-        size=12,
-        description="Team/consulting organization name.",
-        default=DEFAULT_TEAM_NAME,
-    ),
-    dict(
-        label="Compliance Frameworks",
-        fieldType="input",
-        display="general",
-        displaySub="",
-        size=12,
-        description="Applicable frameworks, e.g. NIST CSF 2.0.",
-        default=DEFAULT_COMPLIANCE_FRAMEWORKS,
-    ),
-    dict(
-        label="Business Risk",
-        fieldType="select",
-        display="finding",
-        displaySub="",
-        size=4,
-        description="Business-facing risk rating.",
-        options=RISK_OPTIONS,
-        default="",
-    ),
-    dict(
-        label="Risk Impact",
-        fieldType="select",
-        display="finding",
-        displaySub="",
-        size=4,
-        description="Business impact rating.",
-        options=RISK_OPTIONS,
-        default="",
-    ),
-    dict(
-        label="Risk Probability",
-        fieldType="select",
-        display="finding",
-        displaySub="",
-        size=4,
-        description="Likelihood/probability rating.",
-        options=RISK_OPTIONS,
-        default="",
-    ),
-    dict(
-        label="Attack Tactic",
-        fieldType="input",
-        display="finding",
-        displaySub="",
-        size=4,
-        description="MITRE ATT&CK tactic.",
-        default="",
-    ),
-    dict(
-        label="Attack Technique ID",
-        fieldType="input",
-        display="finding",
-        displaySub="",
-        size=4,
-        description="MITRE ATT&CK technique/sub-technique ID.",
-        default="",
-    ),
-    dict(
-        label="Detection Gaps",
-        fieldType="input",
-        display="finding",
-        displaySub="",
-        size=4,
-        description="Missing telemetry, alerting, or logging.",
-        default="",
-    ),
+    {
+        "label": "Business Risk",
+        "fieldType": "select",
+        "display": "finding",
+        "displaySub": "",
+        "size": 4,
+        "description": "Final business-facing risk rating for the finding.",
+        "options": RISK_OPTIONS,
+        "default": "",
+    },
+    {
+        "label": "Risk Impact",
+        "fieldType": "select",
+        "display": "finding",
+        "displaySub": "",
+        "size": 4,
+        "description": "Impact rating used when determining business risk.",
+        "options": RISK_OPTIONS,
+        "default": "",
+    },
+    {
+        "label": "Risk Probability",
+        "fieldType": "select",
+        "display": "finding",
+        "displaySub": "",
+        "size": 4,
+        "description": "Likelihood/probability rating used when determining business risk.",
+        "options": RISK_OPTIONS,
+        "default": "",
+    },
+    {
+        "label": "Attack Tactic",
+        "fieldType": "input",
+        "display": "finding",
+        "displaySub": "",
+        "size": 4,
+        "description": "MITRE ATT&CK tactic associated with the finding, when applicable.",
+        "default": "",
+    },
+    {
+        "label": "Attack Technique ID",
+        "fieldType": "input",
+        "display": "finding",
+        "displaySub": "",
+        "size": 4,
+        "description": "MITRE ATT&CK technique or sub-technique ID, when applicable.",
+        "default": "",
+    },
+    {
+        "label": "Detection Gaps",
+        "fieldType": "input",
+        "display": "finding",
+        "displaySub": "",
+        "size": 12,
+        "description": "Detection, logging, or monitoring considerations for the finding.",
+        "default": "",
+    },
 ]
 
 
-# ============================== API CLIENT ================================
+# The findings-only template intentionally uses no custom report sections.
+SECTIONS = []
+
+
+# Exact tags that must exist in the DOCX before the script will upload it.
+REQUIRED_TEMPLATE_TAGS = [
+    "{#findings}",
+    "{identifier}",
+    "{title}",
+    "{cvss.baseSeverity}",
+    "{cvss.baseMetricScore}",
+    "{cvss.vectorString}",
+    "{businessrisk}",
+    "{riskimpact}",
+    "{riskprobability}",
+    "{vulnType}",
+    "{@affected | convertHTML}",
+    "{-w:p description}",
+    "{/description}",
+    "{-w:p observation}",
+    "{/observation}",
+    "{-w:p poc}",
+    "{-w:p images}",
+    "{%image}",
+    "{caption}",
+    "{/images}",
+    "{/poc}",
+    "{-w:p remediation}",
+    "{/remediation}",
+    "{detectiongaps}",
+    "{attacktactic}",
+    "{attacktechniqueid}",
+    "{-w:p references}{.}{/references}",
+    "{/findings}",
+]
+
+
+# ============================================================================
+# API CLIENT
+# ============================================================================
+
 
 class PwnDocError(RuntimeError):
     pass
@@ -160,7 +189,7 @@ class Client:
         data = None
         headers = {
             "Accept": "application/json",
-            "User-Agent": "cptc-pwndoc-bootstrap/2.0",
+            "User-Agent": "cptc-findings-pwndoc-bootstrap/1.0",
         }
 
         if body is not None:
@@ -200,7 +229,7 @@ class Client:
                     if "data" in payload:
                         return payload["data"]
 
-                    # Compatibility with older PwnDoc API response wrappers.
+                    # Compatibility with older PwnDoc response wrappers.
                     if "datas" in payload:
                         return payload["datas"]
 
@@ -257,14 +286,137 @@ class Client:
         return self.get("/api/users/me")
 
 
-# ============================== HELPERS ===================================
+# ============================================================================
+# LOCAL TEMPLATE PREFLIGHT
+# ============================================================================
+
+
+WORD_NAMESPACE = {
+    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+}
+
 
 def say(prefix, text):
     print(f"{prefix} {text}")
 
 
+def read_docx_paragraphs(path):
+    if not path.exists():
+        raise PwnDocError(f"Template not found: {path}")
+
+    if path.suffix.lower() != ".docx":
+        raise PwnDocError(f"Template must be a .docx file: {path}")
+
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            xml_bytes = archive.read("word/document.xml")
+    except (zipfile.BadZipFile, KeyError) as error:
+        raise PwnDocError(
+            f"Could not read Word document structure from {path}: {error}"
+        ) from error
+
+    root = ET.fromstring(xml_bytes)
+    paragraphs = []
+
+    for paragraph in root.findall(".//w:p", WORD_NAMESPACE):
+        text_parts = []
+
+        for text_node in paragraph.findall(".//w:t", WORD_NAMESPACE):
+            if text_node.text:
+                text_parts.append(text_node.text)
+
+        paragraphs.append("".join(text_parts).strip())
+
+    return paragraphs
+
+
+def extract_tags(paragraphs):
+    tag_pattern = re.compile(r"\{[^{}]+\}")
+    tags = []
+
+    for paragraph in paragraphs:
+        tags.extend(tag_pattern.findall(paragraph))
+
+    return tags
+
+
+def preflight_template(path, verbose=True):
+    paragraphs = read_docx_paragraphs(path)
+    all_text = "\n".join(paragraphs)
+    tags = extract_tags(paragraphs)
+
+    errors = []
+    warnings = []
+
+    for required_tag in REQUIRED_TEMPLATE_TAGS:
+        if required_tag not in all_text:
+            errors.append(f"Missing required tag: {required_tag}")
+
+    # PwnDoc/docxtemplater raw HTML insertions must be alone in their paragraph.
+    for paragraph in paragraphs:
+        if "{@" in paragraph and not re.fullmatch(r"\{@[^{}]+\}", paragraph):
+            errors.append(
+                "Raw HTML tag is not alone in its paragraph: " + paragraph
+            )
+
+        if "{%image}" in paragraph and paragraph != "{%image}":
+            errors.append(
+                "Image tag is not alone in its paragraph: " + paragraph
+            )
+
+    # Confirm every custom field expected by this setup is represented in the DOCX.
+    for label, tag_name in FIELD_TAGS.items():
+        expected_tag = "{" + tag_name + "}"
+
+        if expected_tag not in all_text:
+            errors.append(
+                f"Custom field '{label}' is configured, but {expected_tag} "
+                "is not present in the template."
+            )
+
+    # These are not fatal, but they usually indicate the wrong template was selected.
+    if "{-w:p poc}" not in all_text or "{-w:p images}" not in all_text:
+        warnings.append(
+            "The PoC screenshot/image loop was not detected. Validation screenshots "
+            "may not render."
+        )
+
+    if verbose:
+        print("Template preflight")
+        print("------------------")
+        print(f"Template: {path}")
+        print(f"Paragraphs checked: {len(paragraphs)}")
+        print(f"Tags found: {len(tags)}")
+
+        if warnings:
+            for warning in warnings:
+                say("[!]", warning)
+
+        if errors:
+            for error in errors:
+                say("[X]", error)
+        else:
+            say("[+]", "Template tag preflight PASSED.")
+
+            print("\nCustom field tag mapping")
+            print("------------------------")
+
+            for label, tag_name in FIELD_TAGS.items():
+                print(f"{label:22} -> {{{tag_name}}}")
+
+            print("PoC text                -> Validation and Attack Replication")
+            print("PoC images              -> Validation Screenshots / Evidence")
+
+    return not errors
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+
 def backup_json(name, obj):
-    backup_directory = Path.cwd() / ".pwndoc-cptc-backup"
+    backup_directory = Path.cwd() / ".pwndoc-cptc-findings-backup"
     backup_directory.mkdir(exist_ok=True)
 
     backup_path = backup_directory / (
@@ -308,7 +460,10 @@ def prompt_password(prompt="PwnDoc admin password: "):
     return getpass.getpass(prompt)
 
 
-# ============================== FIRST RUN =================================
+# ============================================================================
+# FIRST RUN / AUTHENTICATION
+# ============================================================================
+
 
 def initialize_admin_if_needed(client, args):
     needs_initialization = client.get("/api/users/init")
@@ -318,7 +473,7 @@ def initialize_admin_if_needed(client, args):
 
     if args.verify_only:
         raise PwnDocError(
-            "PwnDoc has no users yet. Run the bootstrap normally once before --verify-only."
+            "PwnDoc has no users yet. Run the setup normally once before --verify-only."
         )
 
     print("\nFirst PwnDoc Administrator")
@@ -381,13 +536,16 @@ def authenticate(client, args, initialized_credentials=None):
     if "admin" not in user.get("roles", []):
         say(
             "[!]",
-            "This account is not an admin. CPTC Custom Data changes may fail.",
+            "This account is not an admin. Template/custom-data changes may fail.",
         )
 
     return user
 
 
-# ============================== LANGUAGES =================================
+# ============================================================================
+# LANGUAGE
+# ============================================================================
+
 
 def ensure_primary_language(client):
     languages = client.get("/api/data/languages") or []
@@ -422,20 +580,21 @@ def ensure_primary_language(client):
     if not locales:
         raise PwnDocError("No usable PwnDoc languages exist.")
 
-    locale = (
-        PRIMARY_LOCALE
-        if PRIMARY_LOCALE in locales
-        else locales[0]
-    )
+    locale = PRIMARY_LOCALE if PRIMARY_LOCALE in locales else locales[0]
 
     return locales, locale
 
 
-# ============================== TEMPLATE ==================================
+# ============================================================================
+# TEMPLATE
+# ============================================================================
+
 
 def ensure_template(client, path):
-    if not path.exists():
-        raise PwnDocError(f"Template not found: {path}")
+    if not preflight_template(path, verbose=False):
+        raise PwnDocError(
+            "Template preflight failed. Run with --preflight-only to see the problems."
+        )
 
     templates = client.get("/api/templates") or []
 
@@ -451,9 +610,7 @@ def ensure_template(client, path):
     payload = {
         "name": TEMPLATE_NAME,
         "ext": "docx",
-        "file": base64.b64encode(
-            path.read_bytes()
-        ).decode("ascii"),
+        "file": base64.b64encode(path.read_bytes()).decode("ascii"),
     }
 
     if existing:
@@ -479,7 +636,10 @@ def ensure_template(client, path):
     return created["_id"]
 
 
-# ============================== CUSTOM FIELDS =============================
+# ============================================================================
+# CUSTOM FIELDS
+# ============================================================================
+
 
 def ensure_fields(client, locales):
     fields = client.get("/api/data/custom-fields") or []
@@ -538,18 +698,12 @@ def ensure_fields(client, locales):
 
             if specification["fieldType"] == "select":
                 current_options = {
-                    (
-                        option.get("locale"),
-                        option.get("value"),
-                    )
+                    (option.get("locale"), option.get("value"))
                     for option in match.get("options", [])
                 }
 
                 wanted_options = {
-                    (
-                        option.get("locale"),
-                        option.get("value"),
-                    )
+                    (option.get("locale"), option.get("value"))
                     for option in options
                 }
 
@@ -589,70 +743,20 @@ def ensure_fields(client, locales):
             fields,
         )
 
-        say("[*]", f"Field metadata backup: {backup_path}")
+        say("[*]", f"Custom-field backup: {backup_path}")
 
         client.put(
             "/api/data/custom-fields",
             fields,
         )
 
-        say("[+]", "Synchronized existing CPTC fields")
+        say("[+]", "Synchronized existing CPTC findings fields")
 
 
-# ============================== CUSTOM SECTIONS ===========================
+# ============================================================================
+# AUDIT TYPE
+# ============================================================================
 
-def ensure_sections(client):
-    current = client.get("/api/data/sections") or []
-
-    for name, field_name in SECTIONS:
-        same_field = next(
-            (
-                section
-                for section in current
-                if section.get("field") == field_name
-            ),
-            None,
-        )
-
-        same_name = next(
-            (
-                section
-                for section in current
-                if section.get("name") == name
-            ),
-            None,
-        )
-
-        if same_field:
-            if same_field.get("name") != name:
-                raise PwnDocError(
-                    f"Section field '{field_name}' already belongs to "
-                    f"'{same_field.get('name')}'."
-                )
-
-            say("[*]", f"Section exists: {name}")
-            continue
-
-        if same_name:
-            raise PwnDocError(
-                f"Section '{name}' exists with the wrong field "
-                f"'{same_name.get('field')}'."
-            )
-
-        created = client.post(
-            "/api/data/sections",
-            {
-                "name": name,
-                "field": field_name,
-                "icon": "description",
-            },
-        )
-
-        current.append(created)
-        say("[+]", f"Created section: {name} -> {field_name}")
-
-
-# ============================== AUDIT TYPE ================================
 
 def clean_type(audit_type):
     return {
@@ -665,12 +769,8 @@ def clean_type(audit_type):
             for template in audit_type.get("templates", [])
             if template.get("template") and template.get("locale")
         ],
-        "sections": list(
-            audit_type.get("sections", [])
-        ),
-        "hidden": list(
-            audit_type.get("hidden", [])
-        ),
+        "sections": list(audit_type.get("sections", [])),
+        "hidden": list(audit_type.get("hidden", [])),
         "stage": audit_type.get("stage", "default"),
     }
 
@@ -687,10 +787,7 @@ def ensure_audit_type(client, template_id, locales):
             }
             for locale in locales
         ],
-        "sections": [
-            field_name
-            for _, field_name in SECTIONS
-        ],
+        "sections": [],
         "hidden": [],
         "stage": "default",
     }
@@ -739,12 +836,14 @@ def ensure_audit_type(client, template_id, locales):
     say("[+]", f"Synchronized audit type: {AUDIT_TYPE_NAME}")
 
 
-# ============================== VERIFICATION ==============================
+# ============================================================================
+# VERIFICATION
+# ============================================================================
 
-def verify(client):
+
+def verify(client, template_path=None):
     templates = client.get("/api/templates") or []
     fields = client.get("/api/data/custom-fields") or []
-    sections = client.get("/api/data/sections") or []
     audit_types = client.get("/api/data/audit-types") or []
 
     wanted_fields = {
@@ -765,16 +864,6 @@ def verify(client):
         for field in fields
     }
 
-    wanted_sections = {
-        field_name
-        for _, field_name in SECTIONS
-    }
-
-    have_sections = {
-        section.get("field")
-        for section in sections
-    }
-
     template_ok = any(
         template.get("name") == TEMPLATE_NAME
         for template in templates
@@ -786,39 +875,43 @@ def verify(client):
     )
 
     fields_ok = wanted_fields <= have_fields
-    sections_ok = wanted_sections <= have_sections
+
+    local_template_ok = True
+
+    if template_path is not None:
+        local_template_ok = preflight_template(
+            template_path,
+            verbose=False,
+        )
 
     print("\nVerification")
     print("------------")
-    print(f"Template:      {'OK' if template_ok else 'MISSING'}")
+    print(f"Local template: {'OK' if local_template_ok else 'FAILED'}")
+    print(f"PwnDoc template: {'OK' if template_ok else 'MISSING'}")
     print(
-        "Custom fields: "
+        "Custom fields:  "
         f"{len(wanted_fields & have_fields)}/{len(wanted_fields)}"
     )
-    print(
-        "Sections:      "
-        f"{len(wanted_sections & have_sections)}/{len(wanted_sections)}"
-    )
-    print(f"Audit type:    {'OK' if audit_type_ok else 'MISSING'}")
+    print(f"Audit type:     {'OK' if audit_type_ok else 'MISSING'}")
 
     return (
-        template_ok
+        local_template_ok
+        and template_ok
         and fields_ok
-        and sections_ok
         and audit_type_ok
     )
 
 
-# ============================== TEST AUDIT ================================
+# ============================================================================
+# OPTIONAL TEST AUDIT
+# ============================================================================
+
 
 def create_test_audit(client, locale):
-    name = "CPTC Template Test"
+    name = "CPTC Findings Template Test"
     audits = client.get("/api/audits") or []
 
-    if any(
-        audit.get("name") == name
-        for audit in audits
-    ):
+    if any(audit.get("name") == name for audit in audits):
         say("[*]", f"Test audit already exists: {name}")
         return
 
@@ -834,29 +927,40 @@ def create_test_audit(client, locale):
     audit = result.get("audit", result)
     audit_id = audit.get("_id")
 
-    if audit_id:
-        client.put(
-            f"/api/audits/{audit_id}/network",
-            {
-                "scope": [
-                    {
-                        "name": "10.0.0.0/24",
-                        "hosts": [],
-                    }
-                ]
-            },
-        )
+    say("[+]", f"Created test audit: {name}")
 
-        say("[+]", f"Created test audit: {name}")
+    if audit_id:
         say("[*]", f"Open: {client.base}/audits/{audit_id}")
 
+    print("\nTest finding checklist")
+    print("----------------------")
+    print("Add one realistic finding and fill:")
+    print("  [ ] Title + category")
+    print("  [ ] CVSS score/vector")
+    print("  [ ] Business Risk")
+    print("  [ ] Risk Impact")
+    print("  [ ] Risk Probability")
+    print("  [ ] Affected systems")
+    print("  [ ] Description / Overview")
+    print("  [ ] Observation / Business Impact")
+    print("  [ ] PoC text with numbered validation steps")
+    print("  [ ] 2-3 PoC screenshots WITH captions")
+    print("  [ ] Remediation")
+    print("  [ ] Detection Gaps")
+    print("  [ ] ATT&CK Tactic + Technique ID")
+    print("  [ ] References")
+    print("Then generate the report with CPTC_Findings_Only.")
 
-# ============================== MAIN ======================================
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
 
 def main():
     argument_parser = argparse.ArgumentParser(
         description=(
-            "Set up the CPTC template and custom reporting data in PwnDoc."
+            "Set up the minimal CPTC findings-only template and custom fields in PwnDoc."
         )
     )
 
@@ -898,6 +1002,12 @@ def main():
     )
 
     argument_parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Check the DOCX tags locally without connecting to PwnDoc.",
+    )
+
+    argument_parser.add_argument(
         "--verify-tls",
         action="store_true",
         default=VERIFY_TLS,
@@ -905,18 +1015,26 @@ def main():
 
     args = argument_parser.parse_args()
 
-    print("CPTC PwnDoc Bootstrap")
-    print("======================")
+    print("CPTC Findings-Only PwnDoc Setup")
+    print("================================")
     print(f"PwnDoc:     {args.url}")
     print(f"Template:   {args.template}")
+    print(f"Template ID: {TEMPLATE_NAME}")
     print(f"Audit type: {AUDIT_TYPE_NAME}\n")
 
-    client = Client(
-        args.url,
-        args.verify_tls,
-    )
-
     try:
+        if args.preflight_only:
+            return 0 if preflight_template(args.template) else 1
+
+        if not preflight_template(args.template):
+            print("\n[X] Template preflight failed. Nothing was uploaded.")
+            return 1
+
+        client = Client(
+            args.url,
+            args.verify_tls,
+        )
+
         initialized_credentials = initialize_admin_if_needed(
             client,
             args,
@@ -929,33 +1047,33 @@ def main():
         )
 
         if args.verify_only:
-            ready = verify(client)
+            ready = verify(
+                client,
+                args.template,
+            )
 
             if ready:
-                print("\n[+] CPTC PwnDoc verification PASSED.")
+                print("\n[+] CPTC findings-only verification PASSED.")
                 return 0
 
-            print("\n[!] CPTC PwnDoc verification FAILED.")
+            print("\n[!] CPTC findings-only verification FAILED.")
             return 1
 
         locales, locale = ensure_primary_language(client)
 
-        print("\n1) Report template")
+        print("\n1) Findings-only template")
         template_id = ensure_template(
             client,
             args.template,
         )
 
-        print("\n2) Custom fields")
+        print("\n2) Finding custom fields")
         ensure_fields(
             client,
             locales,
         )
 
-        print("\n3) Custom sections")
-        ensure_sections(client)
-
-        print("\n4) Audit type")
+        print("\n3) Findings-only audit type")
         ensure_audit_type(
             client,
             template_id,
@@ -963,30 +1081,37 @@ def main():
         )
 
         if args.create_test_audit:
-            print("\n5) Test audit")
+            print("\n4) Test audit")
             create_test_audit(
                 client,
                 locale,
             )
 
-        ready = verify(client)
+        ready = verify(
+            client,
+            args.template,
+        )
 
         if ready:
-            print("\n[+] CPTC PwnDoc setup is READY.")
-            print(f"    Create audits with: {AUDIT_TYPE_NAME}")
+            print("\n[+] CPTC findings-only PwnDoc setup is READY.")
+            print(f"    Audit type: {AUDIT_TYPE_NAME}")
+            print(f"    Template:   {TEMPLATE_NAME}")
+            print("\nRecommended next step:")
+            print("  Create a test audit, add one full finding with 2-3 screenshots,")
+            print("  generate the DOCX, and confirm every screenshot/caption renders.")
             return 0
 
         print("\n[!] Setup verification failed.")
         return 1
 
     except PwnDocError as error:
-        print(
-            f"\n[ERROR] {error}",
-            file=sys.stderr,
-        )
-
+        print(f"\n[X] {error}")
         return 1
+
+    except KeyboardInterrupt:
+        print("\n[!] Cancelled.")
+        return 130
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
