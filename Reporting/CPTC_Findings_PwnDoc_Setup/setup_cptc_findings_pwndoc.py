@@ -13,9 +13,11 @@ import argparse
 import base64
 import getpass
 import http.cookiejar
+import ipaddress
 import json
 import re
 import ssl
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -953,6 +955,193 @@ def create_test_audit(client, locale):
 
 
 # ============================================================================
+# TEAM NETWORK ACCESS
+# ============================================================================
+
+
+def detect_team_ipv4_addresses():
+    """Return likely LAN IPv4 addresses, excluding common virtual/container links."""
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
+
+    candidates = []
+    ignored_prefixes = (
+        "docker",
+        "br-",
+        "veth",
+        "virbr",
+        "zt",
+    )
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+
+        interface = parts[1]
+        address = parts[3].split("/", 1)[0]
+
+        if interface == "lo" or interface.startswith(ignored_prefixes):
+            continue
+
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+
+        if parsed.version != 4 or parsed.is_loopback:
+            continue
+
+        candidates.append((interface, address))
+
+    return candidates
+
+
+def validate_team_ip(value):
+    try:
+        parsed = ipaddress.ip_address(value.strip())
+    except ValueError as error:
+        raise PwnDocError(
+            f"'{value}' is not a valid IP address. Use the IPv4 address of the "
+            "PwnDoc host on the TEAM-X network."
+        ) from error
+
+    if parsed.version != 4:
+        raise PwnDocError("Use an IPv4 address for --team-ip.")
+
+    if parsed.is_loopback:
+        raise PwnDocError(
+            "127.0.0.1 is localhost and cannot be used by teammates. "
+            "Enter the host's LAN/competition-network IPv4 address instead."
+        )
+
+    return str(parsed)
+
+
+def choose_team_ip(provided=None, no_prompt=False):
+    """Get the address teammates should enter in their browsers."""
+    if provided:
+        return validate_team_ip(provided)
+
+    if no_prompt or not sys.stdin.isatty():
+        return None
+
+    candidates = detect_team_ipv4_addresses()
+
+    print("\nTEAM-X Network Access")
+    print("---------------------")
+
+    if candidates:
+        print("Detected possible host addresses:")
+        for interface, address in candidates:
+            print(f"  {interface:<12} {address}")
+        print()
+
+    print(
+        "Enter the IPv4 address teammates should use to reach this PwnDoc host.\n"
+        "This does not have to be known ahead of time; enter the competition/LAN IP\n"
+        "assigned to this machine after you connect to the team network."
+    )
+
+    while True:
+        value = input("Team-access IP (press Enter to skip): ").strip()
+
+        if not value:
+            return None
+
+        try:
+            return validate_team_ip(value)
+        except PwnDocError as error:
+            print(f"[!] {error}")
+
+
+def get_8443_listeners():
+    try:
+        result = subprocess.run(
+            ["ss", "-ltnH"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
+
+    listeners = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+
+        local = parts[3]
+        if local.endswith(":8443") or local.endswith("]:8443"):
+            listeners.append(local)
+
+    return listeners
+
+
+def show_team_access(team_ip):
+    if not team_ip:
+        print("\n[*] Team-access IP was not set.")
+        print("    Later, rerun with: --team-ip <HOST_IP>")
+        return
+
+    listeners = get_8443_listeners()
+
+    print("\nTEAM-X PwnDoc Access")
+    print("---------------------")
+    print(f"Host IP:  {team_ip}")
+    print(f"Team URL: https://{team_ip}:8443")
+
+    if not listeners:
+        print("Port 8443: no listener detected with ss")
+        print("[!] Confirm PwnDoc is running before teammates connect.")
+        return
+
+    print("Port 8443 listeners:")
+    for listener in listeners:
+        print(f"  {listener}")
+
+    public_bind = any(
+        listener.startswith("0.0.0.0:8443")
+        or listener.startswith("*:8443")
+        or listener.startswith("[::]:8443")
+        for listener in listeners
+    )
+
+    exact_bind = any(
+        listener.startswith(f"{team_ip}:8443")
+        for listener in listeners
+    )
+
+    loopback_only = all(
+        listener.startswith("127.0.0.1:8443")
+        or listener.startswith("[::1]:8443")
+        for listener in listeners
+    )
+
+    if public_bind or exact_bind:
+        print("[+] Port 8443 appears reachable on the selected host interface.")
+    elif loopback_only:
+        print("[!] PwnDoc is listening only on localhost.")
+        print("    Docker/Compose must publish 8443 on 0.0.0.0 (or this host IP)")
+        print("    before teammates can connect.")
+    else:
+        print("[!] Port 8443 is listening, but the bind address could not be confirmed")
+        print("    for the selected team IP. Test from a teammate's machine.")
+
+    print("\nTeammate test:")
+    print(f"  curl -kI https://{team_ip}:8443")
+    print(f"  # or open https://{team_ip}:8443 in a browser")
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -1008,6 +1197,20 @@ def main():
     )
 
     argument_parser.add_argument(
+        "--team-ip",
+        help=(
+            "IPv4 address teammates should use to reach this host. "
+            "If omitted, the script asks interactively after setup."
+        ),
+    )
+
+    argument_parser.add_argument(
+        "--no-network-prompt",
+        action="store_true",
+        help="Do not ask for the TEAM-X/LAN access IP after setup.",
+    )
+
+    argument_parser.add_argument(
         "--verify-tls",
         action="store_true",
         default=VERIFY_TLS,
@@ -1054,6 +1257,11 @@ def main():
 
             if ready:
                 print("\n[+] CPTC findings-only verification PASSED.")
+                team_ip = choose_team_ip(
+                    args.team_ip,
+                    args.no_network_prompt,
+                )
+                show_team_access(team_ip)
                 return 0
 
             print("\n[!] CPTC findings-only verification FAILED.")
@@ -1099,6 +1307,12 @@ def main():
             print("\nRecommended next step:")
             print("  Create a test audit, add one full finding with 2-3 screenshots,")
             print("  generate the DOCX, and confirm every screenshot/caption renders.")
+
+            team_ip = choose_team_ip(
+                args.team_ip,
+                args.no_network_prompt,
+            )
+            show_team_access(team_ip)
             return 0
 
         print("\n[!] Setup verification failed.")
