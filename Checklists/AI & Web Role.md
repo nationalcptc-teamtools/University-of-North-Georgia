@@ -1,8 +1,5 @@
 # CPTC12 - AI Lead & Web Role Checklist
 
-**Season:** CPTC12 (2026–2027) | **Client/Theme:** Butters Family Farm (theme park)
-**Role owner:** Thomas Murillo-Bivins | **Last updated:** 2026-10-20
-
 ---
 
 ## 1. Enumerate & test the client's AI/ML systems
